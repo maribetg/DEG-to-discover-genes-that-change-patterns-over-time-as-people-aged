@@ -1,0 +1,105 @@
+##Differential expression analysis to discover genes that change patterns over time as people aged.
+
+#Samples are reads from two groups of aged human, fetal (<0 years) and adult (20-50 years)
+#Data. Dowloaded from NCBI SRA from Jaffe et al. 2015. Developmental regulation of human cortex transcription and its clinical relevance. Nat Neurosci. 18: 154-161.
+#Phenotype table of the samples was created. It has 11 columns as sample.code, sample.name, age, age.group, sex, RIN, race, total.reads.mapped, aligment.rate, quality.score, GC
+#Aligment of 3 samples from each age group (fetal and adult) with human reference genome h19 was conducted using HISAT2 software in unix
+
+#Feature counts to assign genomic features to the mapped reads
+library(Rsubread)
+filenames <- c("sample1.bam", "sample2.bam", "sample3.bam", "sample4.bam", "sample5.bam", "sample6.bam")
+fc <- featureCounts(filenames, annot.inbuilt = "hg19", isGTFAnnotationFile = False) 
+head(fc$counts)
+
+#Merge data
+library(tidyverse)
+data = list.files(path = "/Users/mari/Documents/Data-human/features", pattern = "tabular$", full.names = TRUE)
+data_list = lapply(data, read.table)
+ndata <- merge(data_list, ID, all.x = TRUE, all.y = FALSE, by.x = "gene_ID", by.y = "ENTREZID")
+
+#write table
+write.table(ndata, file="feature_counts.txt", sep='\t', row.names=TRUE, col.names=TRUE)
+
+#remove rows with none gene ID
+ndata01 <- ndata[!is.na(ndata$gene_ID),]
+
+#Remove low expression data
+feature_table = ndata01[rowMeans(ndata01) > 10, ]
+
+#Create summarized experiment data
+library(GenomicRanges)
+library(SummarizedExperiment)
+table <- read_csv("Phenotype-table.csv")
+row = relist(GRanges(), vector("list", length=nrow(feature_table)))
+explana = SummarizedExperiment(assays = list(counts = feature_table), rowRanges = row, colData = table)
+
+#boxplot of the expression levels
+library(edgeR)
+dge <- DGEList(counts = assay(explana, "counts"), group = table$Age.group)
+dge$samples <- merge(dge$samples, as.data.frame(colData(explana)), by = 0)
+boxplot(dge$counts)
+
+#Log transformation and visualization with boxplot
+log2_dge = log2(dge$counts + 1)
+boxplot(log2_dge)
+
+#perform PCA
+library(ggfortify)
+pca = prcomp(log2_dge, center=TRUE, scale=TRUE)
+dat_pca = data.frame(X=pca$rotation[,2], Y=pca$rotation[,1], Age=table$Age.group, RIN=table$RIN)
+
+#Scatterplot using PC1 and PC2, colored by RIN, shaped by age
+ggplot(dat_pca, aes(x=X, y=Y, shape=Age, color=RIN)) + geom_point(size=5) + xlab("PC2") + ylab("PC1") + theme_bw()
+
+#log2 transformation and remove low expression
+tdata = assay(explana)
+tdata = log2(as.matrix(tdata) + 1)
+tdata = tdata[rowMeans(tdata) > 10, ]
+
+#Create a model seleccting the age.group which constain two variables fetal and adult
+mod = model.matrix(~ explana$Age.group)
+limma = lmFit(tdata,mod)
+ebayes_limma = eBayes(limma)
+limma_top = topTable(ebayes_limma,number=dim(tdata)[1])
+limma_table_output = limma_top[,c(1,4,5)]
+
+#Write results to a tab-delimited file (gene name, log2 fold-change, p-value and adjusted p-value)
+write.table(limma_table_output, file="DEG.txt", sep='\t', row.names=TRUE, col.names=TRUE)
+
+#Volcano plot with marked genes with p-value less than 0.05 in red
+with(limma_top, plot(logFC, -log10(adj.P.Val), pch=20, main="Volcano plot"))
+with(subset(limma_top, adj.P.Val < 0.05), points(logFC, -log10(adj.P.Val), pch=20, col="red"))
+
+#sum Differential Expression Genes
+sum(limma_table_output$adj.P.Val < 0.05) #number DEG
+sum(limma_table_output$adj.P.Val < 0.05 & limma_table_output$logFC > 1) #downregulated genes
+sum(limma_table_output$adj.P.Val < 0.05 & limma_table_output$logFC < -1) #upregulated genes
+
+#Searching for epigenomic changes and creating a human database of those changes
+Library(AnnotationHub)
+library(TxDb.Hsapiens.UCSC.hg19.knownGene)
+ah <- AnnotationHub()
+ah <- subset(ah, species == "Homo sapiens")
+
+#Extracting specific epigenetic changes for adult, fetal and liver H3K4me3
+ah_fetal <- query(ah, c("EpigenomeRoadMap", "H3K4me3", "E081"))
+ah_adult <- query(ah, c("EpigenomeRoadMap", "H3K4me3", "E073"))
+ah_liver <- query(ah, c("EpigenomeRoadMap", "H3K4me3", "E066"))
+
+#creating narrowPeak datasets
+fetal_gr <- ah_fetal[[2]]
+adult_gr <- ah_adult[[2]]
+liver_gr <- ah_liver[[2]]
+
+#Extract differential express genes promoters
+library(mygene)
+dif_e_genes = row.names(limma_top[limma_top$adj.P.Val < 0.05,])
+dif_e_genes_ids = queryMany(dif_e_genes, scopes = "symbol", fields = "entrezgene", species = "human")
+txdb <- TxDb.Hsapiens.UCSC.hg19.knownGene
+txdb_genes <- genes(txdb)
+dif_e_promoters <- promoters(txdb_genes[dif_e_genes_ids$entrezgene %in% txdb_genes$gene_id])
+
+#Finding the overlapping between DEG and narrowpeacks countaining H3K4me3
+adult_perc_peak = length(subsetByOverlaps(adult_gr, dif_e_promoters, ignore.strand=TRUE)) / length(adult_gr)
+fetal_perc_peak = length(subsetByOverlaps(fetal_gr, dif_e_promoters, ignore.strand=TRUE)) / length(fetal_gr)
+liver_perc_peak = length(subsetByOverlaps(liver_gr, dif_e_promoters, ignore.strand=TRUE)) / length(liver_gr)
